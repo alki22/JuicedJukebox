@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Tool cache (rebuilt DSB intermediate)
+.cache/
+
+# Diagnostics / scratch files
+diag/
+test_*.wma
+track26_*.wma
+track26_*.asf
+track26_*.wav
+
+# User input — folder is tracked, contents are not
+input/*
+!input/.gitkeep
