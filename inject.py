@@ -242,8 +242,9 @@ def inject(input_dir: Path, dry_run: bool) -> int:
             start_ms, end_ms = wma.append_track_to_dsb(current_dsb, encoded_wma, next_dsb)
             current_dsb = next_dsb
 
-            # cum_offset_units is the seek target (seconds); derive from actual timestamp.
-            cum = wma.duration_units(start_ms / 1000)
+            # cum_offset_units is the cumulative sum of all preceding track durations,
+            # matching how the stock music.dat is laid out (not derived from timestamps).
+            cum = sum(r.size_units for r in new_records)
             su  = wma.duration_units((end_ms - start_ms) / 1000)
             new_records.append(bankfmt.Record(
                 size_units=su, wfx=wfx, const=const,
