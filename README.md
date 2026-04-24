@@ -73,7 +73,7 @@ On each run the tool:
    - `presentation_time` (in replicated data) — advanced by the same preroll offset as the stock stream.
 5. **Appends records** to `music.dat` (one per new track), updating the count and cumulative offsets.
 6. **Rewrites** `music.cfg` to bump `bank_size` / `instance_count` and add `declare_stream` + `[BeginSS]` blocks for the new tracks.
-7. **Patches `Juiced.exe`** at 7 sites to raise the hardcoded 25-track limit — the exe is backed up to `Juiced.exe.bak` before the first patch and the operation is idempotent (re-running is safe).
+7. **Patches `Juiced.exe`** at 9 sites to raise the hardcoded 25-track limit and fix PREV wrap-around — the exe is backed up to `Juiced.exe.bak` before the first patch and the operation is idempotent (re-running is safe).
 
 `--restore` copies all four `*.bak` files back over their originals and reverts `Juiced.exe`.
 
@@ -108,11 +108,11 @@ The three patched fields per packet (`send_time`, `object_number`, `presentation
 are all in the fixed-layout single-payload packet header; their byte offsets are derived
 by walking the LTF / property-flags bytes at the start of each packet.
 
-### Exe patches (7 sites)
+### Exe patches (9 sites)
 
-The 25-track limit is enforced at seven independent locations in `Juiced.exe`, each storing
-the count as a single-byte x86 immediate. All seven are patched atomically (validate all →
-backup → write all) and `patch_exe.py` can be run standalone:
+The 25-track limit is enforced at multiple independent locations in `Juiced.exe`. All sites
+are patched atomically (validate all → backup → write all) and `patch_exe.py` can be run
+standalone:
 
 ```bat
 python patch_exe.py --status    # show current values
@@ -129,6 +129,12 @@ python patch_exe.py --restore   # restore from Juiced.exe.bak
 | `0x00029365` | `CMP [esi+4], N` | Audio-event queue full check |
 | `0x0002936B` | `MOV [esi+4], N−1` | Queue wrap-around value |
 | `0x000AA72C` | `CMP [ebp+0x3EC], N` | Last-track / loop-around detection |
+| `0x000AAA8A` | `JE → decrement` | PREV early-exit redirect *(fixed offset)* |
+| `0x000AAAEC` | `MOV [ecx+0x3EC], N` | PREV wrap-around — clamps to last track |
+
+Sites 1–7 patch the NEXT-direction (advance) limit. Sites 8–9 fix the PREV (BACK) direction:
+the stock function silently ignores BACK when already at track 1; after patching it wraps
+to track N instead.
 
 ## File structure
 

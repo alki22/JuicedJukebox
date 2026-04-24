@@ -1,36 +1,15 @@
 """patch_exe.py -- lift the hardcoded 25-track cap in Juiced.exe.
 
-The stock game binary has two locations that hard-limit the music bank to 25
-tracks.  This script patches them to allow up to 26 tracks (the minimum needed
-for one injected song; the limit can be raised further by re-running with a
-larger --max-tracks value).
+The stock game binary has locations that hard-limit the music bank to 25
+tracks.  This script patches them to allow up to N tracks (the minimum needed
+for one injected song is 26; the limit can be raised further by re-running
+with a larger --max value).
 
 Usage:
     python patch_exe.py              # patch to 26 tracks (default)
     python patch_exe.py --max 30     # patch to 30 tracks
     python patch_exe.py --restore    # restore from Juiced.exe.bak
     python patch_exe.py --status     # show current patch state
-
-Patched sites (both must be updated together):
-
-  1. 0x00BE4667  CMP eax, <N>    -- advance-track bounds check.
-     The function at ~0x00BE4510 advances the current in-race/audition track
-     index.  The original code:
-         83 F8 19  CMP eax, 25
-         7D 16     JGE +22         ; if index >= 25, don't advance
-     ...prevents the game from ever setting the track index to 25 (0-based),
-     which is the 26th track slot.  Changing 0x19 -> 0x1A allows index 25.
-
-  2. 0x00BD35C5  MOV ecx, <N>   -- audio-handle array zero-initialiser.
-     The audio subsystem allocates an N-slot array of stream handles (one per
-     track) and zero-fills it before loading.  With ecx=25 the 26th slot is
-     never initialised to NULL, which may cause the player to attempt to use
-     a garbage pointer when track 25 (0-based) is first loaded.  Changing
-     0x19 -> 0x1A ensures the slot starts as NULL, matching the expected
-     pre-load state.
-
-Both sites store the limit as a single byte (the 8-bit immediate of an x86
-short-form instruction), so each patch is a one-byte change.
 
 The patcher backs up Juiced.exe to Juiced.exe.bak before the first patch and
 never overwrites an existing backup.
@@ -150,9 +129,46 @@ _SITE_LAST_TRACK = {
     "desc":    "last-track detection  (CMP [ebp+0x3EC], N; JNZ; loop-around)",
 }
 
+# Site 8: JE redirect in PREV function  (74 <offset>)  at file offset 0x000AAA8A
+#         The PREV / retreat-track function (file offset 0x000AAA80) loads the
+#         current 1-based track index into edx, then immediately does:
+#             83 FA 01  CMP edx, 1
+#             74 65     JE  → RETN          ; if already at track 1, do nothing
+#         This is the "no wrap" early exit: pressing BACK from track 1 is a
+#         silent no-op.  We redirect the JE to jump instead to the single-step
+#         decrement at 0x000AAAC3 (offset 0x37 from the next instruction), so
+#         that BACK from track 1 falls through to the normal decrement path.
+#         Combined with Site 9 (below) the decrement then wraps to track N.
+#         The target offset 0x37 is a fixed code-layout distance, not
+#         track-count-dependent; fixed_value encodes it.
+_SITE_PREV_EARLY_EXIT = {
+    "offset":      0x000AAA86,
+    "prefix":      bytes([0x83, 0xFA, 0x01, 0x74]),  # CMP edx,1 ; JE opcode
+    "imm_off":     4,                                 # the JE displacement byte
+    "fixed_value": 0x37,                              # jump to 000AAAC3 (decrement)
+    "desc":        "PREV early-exit redirect  (JE from at-track-1 check -> decrement)",
+}
+
+# Site 9: PREV clamp-to-wrap  (C7 81 EC 03 00 00 <N> 00 00 00)  at 0x000AAAE6
+#         After the single-step decrement (Site 8's target), the game checks:
+#             83 B9 EC 03 00 00 01  CMP [ecx+0x3EC], 1
+#             7D 0A                 JGE → RETN         ; if index >= 1, keep it
+#             C7 81 EC 03 00 00     ← Site 9 starts here
+#             01 00 00 00           MOV [ecx+0x3EC], 1 ; else clamp to first track
+#         Changing the immediate from 1 to N makes the "clamp" become a
+#         "wrap": when edx reaches 0 (decremented from track 1) the index is
+#         set to N (the last track) instead of staying at 1.
+_SITE_PREV_WRAP_CLAMP = {
+    "offset":  0x000AAAE6,
+    "prefix":  bytes([0xC7, 0x81, 0xEC, 0x03, 0x00, 0x00]),  # MOV [ecx+0x3EC], imm32
+    "imm_off": 6,                                              # low byte of imm32
+    "desc":    "PREV wrap-around  (MOV [ecx+0x3EC], N; wraps backward to last track)",
+}
+
 PATCH_SITES = [
     _SITE_CMP, _SITE_MOV, _SITE_CLAMP_PLAY, _SITE_CLAMP_COND,
     _SITE_QUEUE_CHECK, _SITE_QUEUE_WRAP, _SITE_LAST_TRACK,
+    _SITE_PREV_EARLY_EXIT, _SITE_PREV_WRAP_CLAMP,
 ]
 
 STOCK_TRACK_COUNT = 25   # never patch below this
@@ -202,10 +218,16 @@ def _check_site(data: bytearray, site: dict) -> int:
     return data[off + imm_off]
 
 
-def _apply_site(data: bytearray, site: dict, new_value: int) -> None:
+def _site_actual(site: dict, new_count: int) -> int:
+    """Return the byte value to write for this site given new_count."""
+    if "fixed_value" in site:
+        return site["fixed_value"]
+    return new_count + site.get("value_offset", 0)
+
+
+def _apply_site(data: bytearray, site: dict, new_count: int) -> None:
     _check_site(data, site)  # validate prefix
-    actual = new_value + site.get("value_offset", 0)
-    data[site["offset"] + site["imm_off"]] = actual
+    data[site["offset"] + site["imm_off"]] = _site_actual(site, new_count)
 
 
 def status(data: bytearray) -> None:
@@ -213,8 +235,9 @@ def status(data: bytearray) -> None:
     for site in PATCH_SITES:
         try:
             cur = _check_site(data, site)
-            print("  0x%08X  current=%d (0x%02X)  -- %s" % (
-                site["offset"] + site["imm_off"], cur, cur, site["desc"]))
+            tag = " (fixed)" if "fixed_value" in site else ""
+            print("  0x%08X  current=0x%02X (%d)%s  -- %s" % (
+                site["offset"] + site["imm_off"], cur, cur, tag, site["desc"]))
         except ValueError as e:
             print("  0x%08X  UNRECOGNISED -- %s" % (site["offset"], e))
     bak_state = "present" if EXE_BAK.exists() else "absent"
@@ -243,9 +266,9 @@ def apply_patch(new_count: int) -> None:
     for site in PATCH_SITES:
         byte_off = site["offset"] + site["imm_off"]
         old = data[byte_off]
-        actual = new_count + site.get("value_offset", 0)
+        actual = _site_actual(site, new_count)
         _apply_site(data, site, new_count)
-        print("  patched 0x%08X: %d -> %d  (%s)" % (byte_off, old, actual, site["desc"]))
+        print("  patched 0x%08X: 0x%02X -> 0x%02X  (%s)" % (byte_off, old, actual, site["desc"]))
 
     EXE.write_bytes(data)
     print("\nJuiced.exe patched for %d-track bank." % new_count)
